@@ -1,0 +1,126 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ApiKeyStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum ArtifactStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum DownloadResult {
+  SUCCESS
+  INVALID_KEY
+  RATE_LIMITED
+  ARTIFACT_NOT_FOUND
+  KEY_REVOKED
+}
+
+model User {
+  id            String         @id @default(cuid())
+  email         String         @unique
+  passwordHash  String
+  emailVerified Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  apiKeys       ApiKey[]
+  refreshTokens RefreshToken[]
+  tickets       DownloadTicket[]
+  events        DownloadEvent[]
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model ApiKey {
+  id         String       @id @default(cuid())
+  userId     String
+  prefix     String
+  hash       String       @unique
+  status     ApiKeyStatus @default(ACTIVE)
+  lastUsedAt DateTime?
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tickets    DownloadTicket[]
+  events     DownloadEvent[]
+
+  @@index([userId])
+}
+
+model Artifact {
+  id        String         @id @default(cuid())
+  version   String
+  platform  String
+  arch      String
+  filename  String
+  objectKey String
+  sha256    String
+  size      BigInt?
+  status    ArtifactStatus @default(ACTIVE)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  tickets   DownloadTicket[]
+  events    DownloadEvent[]
+
+  @@unique([version, platform, arch])
+}
+
+model DownloadTicket {
+  id         String   @id @default(cuid())
+  userId     String
+  apiKeyId   String
+  artifactId String
+  ip         String?
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  apiKey     ApiKey   @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+  artifact   Artifact @relation(fields: [artifactId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([apiKeyId])
+  @@index([artifactId])
+}
+
+model DownloadEvent {
+  id         String         @id @default(cuid())
+  userId     String?
+  apiKeyId   String?
+  artifactId String?
+  ip         String?
+  userAgent  String?
+  result     DownloadResult
+  createdAt  DateTime       @default(now())
+  user       User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  apiKey     ApiKey?        @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  artifact   Artifact?      @relation(fields: [artifactId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+}

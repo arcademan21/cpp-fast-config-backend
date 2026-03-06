@@ -123,6 +123,29 @@ export class ApiKeysService {
     };
   }
 
+  async softDeleteKey(userId: string, keyId: string) {
+    const found = await this.prisma.apiKey.findUnique({ where: { id: keyId } });
+    if (!found) {
+      throw new NotFoundException('API key not found');
+    }
+
+    if (found.userId !== userId) {
+      throw new ForbiddenException('API key does not belong to user');
+    }
+
+    return this.prisma.apiKey.update({
+      where: { id: keyId },
+      data: { status: ApiKeyStatus.REVOKED },
+      select: {
+        id: true,
+        prefix: true,
+        status: true,
+        createdAt: true,
+        lastUsedAt: true,
+      },
+    });
+  }
+
   async findActiveByRawKey(rawKey: string) {
     const hash = hashApiKey(rawKey, this.getPepper());
     return this.prisma.apiKey.findUnique({

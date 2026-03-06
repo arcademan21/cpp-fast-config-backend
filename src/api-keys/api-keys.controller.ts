@@ -1,4 +1,12 @@
-import { Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import {
   ApiBadRequestResponse,
   ApiBearerAuth,
@@ -133,5 +141,36 @@ export class ApiKeysController {
   })
   rotate(@Req() req: AuthenticatedRequest, @Param('id') id: string) {
     return this.apiKeysService.rotateKey(req.user.userId, id);
+  }
+
+  @Delete(':id')
+  @ApiOperation({
+    summary: 'Eliminar API key (soft delete)',
+    description:
+      'Marca la API key como REVOKED para mantener compatibilidad sin borrado fisico.',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'Identificador interno de la API key a eliminar.',
+    example: 'cm8za6r8a0001h2c6s2yx1n8k',
+  })
+  @ApiOkResponse({
+    type: ApiKeyDto,
+    description: 'API key eliminada logicamente (status REVOKED).',
+  })
+  @ApiBadRequestResponse({
+    type: ErrorResponseDto,
+    description: 'Parametro id invalido o mal formado.',
+  })
+  @ApiUnauthorizedResponse({
+    type: ErrorResponseDto,
+    description: 'JWT ausente o invalido.',
+  })
+  @ApiInternalServerErrorResponse({
+    type: ErrorResponseDto,
+    description: 'Error interno no esperado.',
+  })
+  softDelete(@Req() req: AuthenticatedRequest, @Param('id') id: string) {
+    return this.apiKeysService.softDeleteKey(req.user.userId, id);
   }
 }

@@ -96,6 +96,11 @@ export class ArtifactsService implements OnModuleInit {
         return latest;
       }
 
+      const relaxedLatest = await this.findRelaxedMatch([version], platform);
+      if (relaxedLatest) {
+        return relaxedLatest;
+      }
+
       const fallbackVersion = this.configService
         .get<string>('ARTIFACT_AUTO_DISCOVERY_VERSION', '')
         .trim();
@@ -127,18 +132,91 @@ export class ArtifactsService implements OnModuleInit {
       return exact;
     }
 
-    const alternateVersion = this.toAlternateSemver(version);
-    if (!alternateVersion) {
-      return null;
+    const hydratedExact = await this.tryHydrateFromStorage(version, platform, arch);
+    if (hydratedExact) {
+      return hydratedExact;
     }
 
-    return this.prisma.artifact.findFirst({
+    const alternateVersion = this.toAlternateSemver(version);
+    if (!alternateVersion) {
+      return this.findRelaxedMatch([version], platform);
+    }
+
+    const alternate = await this.prisma.artifact.findFirst({
       where: {
         version: alternateVersion,
         platform,
         arch,
         status: ArtifactStatus.ACTIVE,
       },
+    });
+
+    if (alternate) {
+      return alternate;
+    }
+
+    const hydratedAlternate = await this.tryHydrateFromStorage(
+      alternateVersion,
+      platform,
+      arch,
+    );
+    if (hydratedAlternate) {
+      return hydratedAlternate;
+    }
+
+    return this.findRelaxedMatch([version, alternateVersion], platform);
+  }
+
+  private async findRelaxedMatch(
+    versions: string[],
+    requestedPlatform: string,
+  ) {
+    const relaxedMatchingEnabled = this.configService.get<string>(
+      'ARTIFACT_RELAXED_MATCHING_ENABLED',
+      'false',
+    );
+
+    if (relaxedMatchingEnabled.toLowerCase() === 'false') {
+      return null;
+    }
+
+    const filteredVersions = versions.filter((value) => value && value !== 'latest');
+    if (filteredVersions.length > 0) {
+      const samePlatformAnyArch = await this.prisma.artifact.findFirst({
+        where: {
+          version: { in: filteredVersions },
+          platform: requestedPlatform,
+          status: ArtifactStatus.ACTIVE,
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      if (samePlatformAnyArch) {
+        this.logger.warn(
+          `Relaxed artifact match used (same platform, any arch): requested versions=[${filteredVersions.join(',')}] platform=${requestedPlatform} -> resolved ${samePlatformAnyArch.version}/${samePlatformAnyArch.platform}/${samePlatformAnyArch.arch}`,
+        );
+        return samePlatformAnyArch;
+      }
+
+      const anyPlatformAnyArch = await this.prisma.artifact.findFirst({
+        where: {
+          version: { in: filteredVersions },
+          status: ArtifactStatus.ACTIVE,
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      if (anyPlatformAnyArch) {
+        this.logger.warn(
+          `Relaxed artifact match used (any target): requested versions=[${filteredVersions.join(',')}] -> resolved ${anyPlatformAnyArch.version}/${anyPlatformAnyArch.platform}/${anyPlatformAnyArch.arch}`,
+        );
+        return anyPlatformAnyArch;
+      }
+    }
+
+    return this.prisma.artifact.findFirst({
+      where: { status: ArtifactStatus.ACTIVE },
+      orderBy: { createdAt: 'desc' },
     });
   }
 
@@ -177,7 +255,8 @@ export class ArtifactsService implements OnModuleInit {
         continue;
       }
 
-      const filename = objectKey.split('/').pop() ??
+      const filename =
+        objectKey.split('/').pop() ??
         `cpp-fast-config-${candidateVersion}-${platform}-${arch}.tar.gz`;
 
       const artifact = await this.prisma.artifact.upsert({
@@ -241,14 +320,19 @@ export class ArtifactsService implements OnModuleInit {
   private async fetchArtifactMetadata(
     objectKey: string,
   ): Promise<{ sha256: string; size: number } | null> {
-    const baseUrl = this.configService.get<string>('DOWNLOAD_BASE_URL', '').trim();
+    const baseUrl = this.configService
+      .get<string>('DOWNLOAD_BASE_URL', '')
+      .trim();
     if (!baseUrl) {
       return null;
     }
 
     const artifactUrl = `${baseUrl.replace(/\/$/, '')}/${objectKey}`;
     const timeoutMs = Number(
-      this.configService.get<string>('ARTIFACT_AUTO_DISCOVERY_TIMEOUT_MS', '15000'),
+      this.configService.get<string>(
+        'ARTIFACT_AUTO_DISCOVERY_TIMEOUT_MS',
+        '15000',
+      ),
     );
 
     return new Promise((resolve) => {
@@ -268,11 +352,7 @@ export class ArtifactsService implements OnModuleInit {
           const statusCode = res.statusCode ?? 0;
           const location = res.headers.location;
 
-          if (
-            location &&
-            statusCode >= 300 &&
-            statusCode < 400
-          ) {
+          if (location && statusCode >= 300 && statusCode < 400) {
             res.resume();
             const nextUrl = new URL(location, urlValue).toString();
             requestUrl(nextUrl, redirects + 1);

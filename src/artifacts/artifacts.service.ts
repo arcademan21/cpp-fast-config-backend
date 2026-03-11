@@ -5,6 +5,9 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
+import { get as httpGet } from 'http';
+import { get as httpsGet } from 'https';
 import { ArtifactStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
@@ -80,7 +83,7 @@ export class ArtifactsService implements OnModuleInit {
 
   async resolve(version: string, platform: string, arch: string) {
     if (version === 'latest') {
-      return this.prisma.artifact.findFirst({
+      const latest = await this.prisma.artifact.findFirst({
         where: {
           platform,
           arch,
@@ -88,6 +91,27 @@ export class ArtifactsService implements OnModuleInit {
         },
         orderBy: { createdAt: 'desc' },
       });
+
+      if (latest) {
+        return latest;
+      }
+
+      const fallbackVersion = this.configService
+        .get<string>('ARTIFACT_AUTO_DISCOVERY_VERSION', '')
+        .trim();
+
+      if (fallbackVersion) {
+        const hydrated = await this.tryHydrateFromStorage(
+          fallbackVersion,
+          platform,
+          arch,
+        );
+        if (hydrated) {
+          return hydrated;
+        }
+      }
+
+      return null;
     }
 
     const exact = await this.prisma.artifact.findFirst({
@@ -115,6 +139,183 @@ export class ArtifactsService implements OnModuleInit {
         arch,
         status: ArtifactStatus.ACTIVE,
       },
+    });
+  }
+
+  private async tryHydrateFromStorage(
+    version: string,
+    platform: string,
+    arch: string,
+  ) {
+    const autoDiscoveryEnabled = this.configService.get<string>(
+      'ARTIFACT_AUTO_DISCOVERY_ENABLED',
+      'true',
+    );
+
+    if (autoDiscoveryEnabled.toLowerCase() === 'false') {
+      return null;
+    }
+
+    const candidateVersions = this.buildCandidateVersions(version);
+    for (const candidateVersion of candidateVersions) {
+      const existing = await this.prisma.artifact.findFirst({
+        where: {
+          version: candidateVersion,
+          platform,
+          arch,
+          status: ArtifactStatus.ACTIVE,
+        },
+      });
+
+      if (existing) {
+        return existing;
+      }
+
+      const objectKey = this.buildObjectKey(candidateVersion, platform, arch);
+      const metadata = await this.fetchArtifactMetadata(objectKey);
+      if (!metadata) {
+        continue;
+      }
+
+      const filename = objectKey.split('/').pop() ??
+        `cpp-fast-config-${candidateVersion}-${platform}-${arch}.tar.gz`;
+
+      const artifact = await this.prisma.artifact.upsert({
+        where: {
+          version_platform_arch: {
+            version: candidateVersion,
+            platform,
+            arch,
+          },
+        },
+        update: {
+          filename,
+          objectKey,
+          sha256: metadata.sha256,
+          size: BigInt(metadata.size),
+          status: ArtifactStatus.ACTIVE,
+        },
+        create: {
+          version: candidateVersion,
+          platform,
+          arch,
+          filename,
+          objectKey,
+          sha256: metadata.sha256,
+          size: BigInt(metadata.size),
+          status: ArtifactStatus.ACTIVE,
+        },
+      });
+
+      this.logger.log(
+        `Artifact auto-discovered and hydrated: ${candidateVersion}/${platform}/${arch}`,
+      );
+
+      return artifact;
+    }
+
+    return null;
+  }
+
+  private buildCandidateVersions(version: string): string[] {
+    const values = [version];
+    const alternate = this.toAlternateSemver(version);
+    if (alternate && alternate !== version) {
+      values.push(alternate);
+    }
+    return values;
+  }
+
+  private buildObjectKey(version: string, platform: string, arch: string) {
+    const pattern = this.configService.get<string>(
+      'ARTIFACT_OBJECT_KEY_PATTERN',
+      'cpp-fast-config/{version}/{platform}-{arch}/cpp-fast-config.tar.gz',
+    );
+
+    return pattern
+      .replace('{version}', version)
+      .replace('{platform}', platform)
+      .replace('{arch}', arch);
+  }
+
+  private async fetchArtifactMetadata(
+    objectKey: string,
+  ): Promise<{ sha256: string; size: number } | null> {
+    const baseUrl = this.configService.get<string>('DOWNLOAD_BASE_URL', '').trim();
+    if (!baseUrl) {
+      return null;
+    }
+
+    const artifactUrl = `${baseUrl.replace(/\/$/, '')}/${objectKey}`;
+    const timeoutMs = Number(
+      this.configService.get<string>('ARTIFACT_AUTO_DISCOVERY_TIMEOUT_MS', '15000'),
+    );
+
+    return new Promise((resolve) => {
+      const maxRedirects = 5;
+      const visited = new Set<string>();
+
+      const requestUrl = (urlValue: string, redirects: number) => {
+        if (redirects > maxRedirects || visited.has(urlValue)) {
+          resolve(null);
+          return;
+        }
+
+        visited.add(urlValue);
+        const requester = urlValue.startsWith('https://') ? httpsGet : httpGet;
+
+        const req = requester(urlValue, (res) => {
+          const statusCode = res.statusCode ?? 0;
+          const location = res.headers.location;
+
+          if (
+            location &&
+            statusCode >= 300 &&
+            statusCode < 400
+          ) {
+            res.resume();
+            const nextUrl = new URL(location, urlValue).toString();
+            requestUrl(nextUrl, redirects + 1);
+            return;
+          }
+
+          if (statusCode < 200 || statusCode >= 300) {
+            res.resume();
+            resolve(null);
+            return;
+          }
+
+          const hash = createHash('sha256');
+          let size = 0;
+
+          res.on('data', (chunk: Buffer) => {
+            size += chunk.length;
+            hash.update(chunk);
+          });
+
+          res.on('end', () => {
+            resolve({
+              sha256: hash.digest('hex'),
+              size,
+            });
+          });
+
+          res.on('error', () => {
+            resolve(null);
+          });
+        });
+
+        req.setTimeout(timeoutMs, () => {
+          req.destroy();
+          resolve(null);
+        });
+
+        req.on('error', () => {
+          resolve(null);
+        });
+      };
+
+      requestUrl(artifactUrl, 0);
     });
   }
 
